@@ -13,3 +13,7 @@ export function authenticateJWT(req, res, next) {
         res.status(401).json({ error: 'Invalid token' });
     }
 }
+
+export function verifyToken(token) {
+  return jwt.verify(token, process.env.JWT_SECRET);
+}
