@@ -1,5 +1,5 @@
 import { Server } from "socket.io";
-import { verifyToken } from "../auth/auth.js";
+import { verifyToken } from "../middleware/auth.js";
 import User from "../models/User.js";
 import Message from "../models/Message.js";
 import Conversation from "../models/Conversation.js";

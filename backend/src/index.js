@@ -31,7 +31,7 @@ app.get("/auth/google/callback", passport.authenticate("google", { session: fals
 );
 
 //Connect to mongodb and start server
-await mongoose.connect(process.env.MONGO_URI);
+await mongoose.connect(process.env.MONGODB_URI);
 console.log("Coonected to MONGODB");
 
 const server = http.createServer(app);
