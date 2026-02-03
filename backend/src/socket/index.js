@@ -1,4 +1,5 @@
 import { Server } from "socket.io";
+import mongoose from "mongoose";
 import { verifyToken } from "../middleware/auth.js";
 import User from "../models/User.js";
 import Message from "../models/Message.js";
@@ -12,6 +13,26 @@ export function attachSocketServer(server, app) {
       credentials: true
     }
   });
+  const rateLimitStore = new Map();
+
+  const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
+  const getLimiterKey = (userId, action) => `${userId}:${action}`;
+  const enforceRateLimit = (userId, action, limit, windowMs) => {
+    const key = getLimiterKey(userId, action);
+    const now = Date.now();
+    const bucket = rateLimitStore.get(key) || { windowStart: now, count: 0 };
+
+    if (now - bucket.windowStart >= windowMs) {
+      bucket.windowStart = now;
+      bucket.count = 0;
+    }
+
+    bucket.count += 1;
+    rateLimitStore.set(key, bucket);
+
+    return bucket.count <= limit;
+  };
+  const requireString = (value) => typeof value === "string" && value.trim().length > 0;
 
   // Authentication middleware
   io.use(async (socket, next) => {
@@ -47,6 +68,16 @@ export function attachSocketServer(server, app) {
     // Start/get a conversation
     socket.on("conversation:start", async ({ otherUserId }, callback) => {
       try {
+        if (!isValidObjectId(otherUserId)) {
+          return callback({ error: "Invalid user" });
+        }
+        if (otherUserId === userId) {
+          return callback({ error: "Cannot start a conversation with yourself" });
+        }
+        if (!enforceRateLimit(userId, "conversation:start", 6, 10_000)) {
+          return callback({ error: "Too many requests" });
+        }
+
         const conversation = await Conversation.findOrCreate(userId, otherUserId);
         const messages = await Message.find({ conversation: conversation._id })
           .sort({ createdAt: 1 })
@@ -63,7 +94,20 @@ export function attachSocketServer(server, app) {
     // Send message in conversation
     socket.on("message:send:conversation", async ({ conversationId, content }, callback) => {
       try {
+        if (!isValidObjectId(conversationId)) {
+          return callback({ error: "Invalid conversation" });
+        }
+        if (!requireString(content)) {
+          return callback({ error: "Message content is required" });
+        }
+        if (!enforceRateLimit(userId, "message:send:conversation", 20, 10_000)) {
+          return callback({ error: "Too many messages" });
+        }
+
         const conversation = await Conversation.findById(conversationId);
+        if (!conversation) {
+          return callback({ error: "Conversation not found" });
+        }
         if (!conversation.participants.includes(userId)) {
           return callback({ error: "Not authorized" });
         }
@@ -71,6 +115,7 @@ export function attachSocketServer(server, app) {
         const message = await Message.create({
           sender: userId,
           conversation: conversationId,
+          room: null,
           content,
           messageType: "text"
         });
@@ -92,9 +137,16 @@ export function attachSocketServer(server, app) {
     // Create a room
     socket.on("room:create", async ({ name, description, isPrivate }, callback) => {
       try {
+        if (!requireString(name)) {
+          return callback({ error: "Room name is required" });
+        }
+        if (!enforceRateLimit(userId, "room:create", 3, 60_000)) {
+          return callback({ error: "Too many room creations" });
+        }
+
         const room = await Room.create({
-          name,
-          description,
+          name: name.trim(),
+          description: typeof description === "string" ? description.trim() : description,
           isPrivate: isPrivate || false,
           createdBy: userId,
           members: [{ user: userId, role: "owner" }]
@@ -110,6 +162,13 @@ export function attachSocketServer(server, app) {
     // Join a room
     socket.on("room:join", async ({ roomId }, callback) => {
       try {
+        if (!isValidObjectId(roomId)) {
+          return callback({ error: "Invalid room" });
+        }
+        if (!enforceRateLimit(userId, "room:join", 12, 10_000)) {
+          return callback({ error: "Too many requests" });
+        }
+
         const room = await Room.findById(roomId).populate("members.user", "name netId");
         if (!room || !room.isMember(userId)) {
           return callback({ error: "Not authorized" });
@@ -117,7 +176,7 @@ export function attachSocketServer(server, app) {
 
         socket.join(`room:${roomId}`);
         
-        const messages = await Message.find({ conversation: roomId })
+        const messages = await Message.find({ room: roomId })
           .sort({ createdAt: 1 })
           .limit(50)
           .populate("sender", "name netId");
@@ -131,6 +190,16 @@ export function attachSocketServer(server, app) {
     // Send message in room
     socket.on("message:send:room", async ({ roomId, content }, callback) => {
       try {
+        if (!isValidObjectId(roomId)) {
+          return callback({ error: "Invalid room" });
+        }
+        if (!requireString(content)) {
+          return callback({ error: "Message content is required" });
+        }
+        if (!enforceRateLimit(userId, "message:send:room", 20, 10_000)) {
+          return callback({ error: "Too many messages" });
+        }
+
         const room = await Room.findById(roomId);
         if (!room || !room.isMember(userId)) {
           return callback({ error: "Not authorized" });
@@ -138,7 +207,8 @@ export function attachSocketServer(server, app) {
 
         const message = await Message.create({
           sender: userId,
-          conversation: roomId,
+          room: roomId,
+          conversation: null,
           content,
           messageType: "text"
         });
@@ -184,18 +254,48 @@ export function attachSocketServer(server, app) {
     // ===== TYPING INDICATOR =====
     
     socket.on("typing:start", ({ conversationId, roomId }) => {
-      if (conversationId) {
-        socket.to(`conversation:${conversationId}`).emit("typing:start", { userId, userName: socket.userName });
-      } else if (roomId) {
-        socket.to(`room:${roomId}`).emit("typing:start", { userId, userName: socket.userName });
+      if (!enforceRateLimit(userId, "typing:start", 15, 5_000)) {
+        return;
+      }
+      if (conversationId && isValidObjectId(conversationId)) {
+        Conversation.findById(conversationId)
+          .then(conversation => {
+            if (conversation && conversation.participants.includes(userId)) {
+              socket.to(`conversation:${conversationId}`).emit("typing:start", { userId, userName: socket.userName });
+            }
+          })
+          .catch(() => {});
+      } else if (roomId && isValidObjectId(roomId)) {
+        Room.findById(roomId)
+          .then(room => {
+            if (room && room.isMember(userId)) {
+              socket.to(`room:${roomId}`).emit("typing:start", { userId, userName: socket.userName });
+            }
+          })
+          .catch(() => {});
       }
     });
 
     socket.on("typing:stop", ({ conversationId, roomId }) => {
-      if (conversationId) {
-        socket.to(`conversation:${conversationId}`).emit("typing:stop", { userId });
-      } else if (roomId) {
-        socket.to(`room:${roomId}`).emit("typing:stop", { userId });
+      if (!enforceRateLimit(userId, "typing:stop", 15, 5_000)) {
+        return;
+      }
+      if (conversationId && isValidObjectId(conversationId)) {
+        Conversation.findById(conversationId)
+          .then(conversation => {
+            if (conversation && conversation.participants.includes(userId)) {
+              socket.to(`conversation:${conversationId}`).emit("typing:stop", { userId });
+            }
+          })
+          .catch(() => {});
+      } else if (roomId && isValidObjectId(roomId)) {
+        Room.findById(roomId)
+          .then(room => {
+            if (room && room.isMember(userId)) {
+              socket.to(`room:${roomId}`).emit("typing:stop", { userId });
+            }
+          })
+          .catch(() => {});
       }
     });
 
