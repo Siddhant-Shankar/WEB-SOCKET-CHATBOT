@@ -56,7 +56,7 @@ const conversationSchema = new mongoose.Schema(
 );
 
 // Compound index to ensure unique conversations between users
-conversationSchema.index({ participants: 1 });
+conversationSchema.index({ participants: 1 }, { unique: true });
 
 // Index for finding user's conversations sorted by activity
 conversationSchema.index({ participants: 1, lastMessageAt: -1 });
@@ -83,6 +83,16 @@ conversationSchema.pre("save", function(next) {
     }));
   }
   
+  next();
+});
+
+conversationSchema.pre("validate", function(next) {
+  if (this.participants && this.participants.length === 2) {
+    this.participants = this.participants
+      .map(id => id.toString())
+      .sort()
+      .map(id => new mongoose.Types.ObjectId(id));
+  }
   next();
 });
 
@@ -198,21 +208,29 @@ conversationSchema.methods.setTyping = function(userId, isTyping) {
 
 // Static method to find or create conversation between two users
 conversationSchema.statics.findOrCreate = async function(user1Id, user2Id) {
-  // Ensure consistent order for querying
-  const participants = [user1Id, user2Id].sort();
-  
-  let conversation = await this.findOne({
-    participants: { $all: participants, $size: 2 }
-  })
-    .populate("participants", "name netId status profilePicture")
-    .populate("lastMessage");
-  
-  if (!conversation) {
-    conversation = await this.create({ participants });
-    conversation = await conversation.populate("participants", "name netId status profilePicture");
+  const participants = [user1Id, user2Id]
+    .map(id => id.toString())
+    .sort()
+    .map(id => new mongoose.Types.ObjectId(id));
+
+  try {
+    const conversation = await this.findOneAndUpdate(
+      { participants },
+      { $setOnInsert: { participants } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    )
+      .populate("participants", "name netId status profilePicture")
+      .populate("lastMessage");
+
+    return conversation;
+  } catch (error) {
+    if (error.code === 11000) {
+      return this.findOne({ participants })
+        .populate("participants", "name netId status profilePicture")
+        .populate("lastMessage");
+    }
+    throw error;
   }
-  
-  return conversation;
 };
 
 // Static method to get user's conversations

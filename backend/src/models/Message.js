@@ -11,7 +11,11 @@ const messageSchema = new mongoose.Schema(
     conversation: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Conversation",
-      required: true,
+      index: true
+    },
+    room: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Room",
       index: true
     },
     content: {
@@ -69,9 +73,22 @@ const messageSchema = new mongoose.Schema(
 
 // Compound index for efficient querying of messages in a conversation
 messageSchema.index({ conversation: 1, createdAt: -1 });
+messageSchema.index({ room: 1, createdAt: -1 });
 
 // Index for finding unread messages
 messageSchema.index({ "readBy.user": 1 });
+
+// Ensure message belongs to a conversation or a room (but not both)
+messageSchema.pre("validate", function(next) {
+  const hasConversation = Boolean(this.conversation);
+  const hasRoom = Boolean(this.room);
+
+  if ((hasConversation && hasRoom) || (!hasConversation && !hasRoom)) {
+    return next(new Error("Message must belong to either a conversation or a room"));
+  }
+
+  return next();
+});
 
 // Method to mark message as read by a user
 messageSchema.methods.markAsRead = function(userId) {
